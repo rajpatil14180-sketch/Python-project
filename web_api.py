@@ -1,21 +1,36 @@
-"""Small standard-library HTTP API for the React/Vite frontend.
-Run from the project root with: python web_api.py
-Uses the existing SQLite database and core services; it does not seed or reset data.
+"""GharPar's standard-library JSON API for the React frontend.
+
+Local development: run ``py web_api.py`` from the project root.
+Production hosting needs HTTPS, a production process manager, and an origin
+allow-list configured through GHARPAR_WEB_ORIGIN; do not expose this dev server
+straight to the public internet.
 """
 import json
+import os
 import secrets
+import sqlite3
 from datetime import date
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs
 
 from database import create_tables, get_connection
 from core.auth import login
-from core.pg_service import get_pgs_for_owner, get_pg_layout, get_pg_summary, get_bed_details
+from core.pg_service import (
+    get_pgs_for_owner, get_pg_layout, get_pg_summary, get_bed_details,
+    get_tenant_home_details,
+)
 from core.finance import get_tenant_financials
-from core.ticket_service import get_tickets_for_pg, update_ticket_status
-from core.announcement_service import get_announcements_for_pg, add_announcement
+from core.tenant_service import add_tenant, add_payment, vacate_tenant
+from core.ticket_service import (
+    get_tickets_for_pg, get_tickets_for_tenant, update_ticket_status, create_ticket,
+)
+from core.announcement_service import (
+    get_announcements_for_pg, add_announcement, delete_announcement,
+)
+from core.pricing import calculate_agreed_price
 
 TOKENS = {}
+WEB_ORIGIN = os.environ.get("GHARPAR_WEB_ORIGIN", "http://127.0.0.1:5173")
 
 
 def _json_default(value):
@@ -25,7 +40,7 @@ def _json_default(value):
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "GharParAPI/1.1"
+    server_version = "GharParAPI/1.2"
 
     def log_message(self, fmt, *args):
         print("[GharPar API] " + fmt % args)
@@ -35,9 +50,12 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Access-Control-Allow-Origin", "http://127.0.0.1:5173")
+        origin = self.headers.get("Origin")
+        if origin == WEB_ORIGIN:
+            self.send_header("Access-Control-Allow-Origin", WEB_ORIGIN)
+            self.send_header("Vary", "Origin")
         self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
         self.end_headers()
         if status != 204:
             self.wfile.write(body)
@@ -56,6 +74,21 @@ class Handler(BaseHTTPRequestHandler):
         token = self.headers.get("Authorization", "").removeprefix("Bearer ")
         return TOKENS.get(token)
 
+    def _owned_pg(self, user, pg_id):
+        return any(item["id"] == pg_id for item in get_pgs_for_owner(user["user_id"]))
+
+    def _tenant_owner(self, tenant_id):
+        conn = get_connection()
+        try:
+            return conn.execute(
+                "SELECT p.owner_id, t.user_id, t.is_active, t.bed_id, r.pg_id "
+                "FROM tenants t LEFT JOIN beds b ON b.id=t.bed_id "
+                "LEFT JOIN rooms r ON r.id=b.room_id "
+                "LEFT JOIN pgs p ON p.id=r.pg_id WHERE t.id=?", (tenant_id,)
+            ).fetchone()
+        finally:
+            conn.close()
+
     def do_OPTIONS(self):
         self._send(204, {})
 
@@ -64,17 +97,42 @@ class Handler(BaseHTTPRequestHandler):
         user = self._user()
         if not user:
             return self._send(401, {"error": "Please sign in to continue."})
-        if user["role"] != "owner":
-            return self._send(403, {"error": "The web workspace currently supports owner accounts."})
         try:
             if path == "/api/me":
-                return self._send(200, {"username": user["username"], "role": user["role"]})
+                return self._send(200, {"username": user["username"], "role": user["role"], "tenant_id": user.get("tenant_id")})
+            if user["role"] == "tenant":
+                if path == "/api/tenant/home":
+                    details = get_tenant_home_details(user["tenant_id"])
+                    financials = get_tenant_financials(user["tenant_id"])
+                    if not details or not details.get("pg_id"):
+                        return self._send(404, {"error": "Your active tenancy could not be found."})
+                    return self._send(200, {
+                        "profile": details, "financials": financials,
+                        "announcements": get_announcements_for_pg(details["pg_id"]),
+                        "tickets": get_tickets_for_tenant(user["tenant_id"]),
+                    })
+                return self._send(403, {"error": "This action is not available to tenant accounts."})
             if path == "/api/pgs":
                 return self._send(200, get_pgs_for_owner(user["user_id"]))
+            if path == "/api/tenant/options":
+                return self._send(200, {"ticket_categories": ["Plumbing", "Electrical", "Wi-Fi", "Cleaning", "Furniture", "Other"], "ticket_urgencies": ["Low", "Medium", "High"]})
+            if path == "/api/pricing/suggestion":
+                query = parse_qs(urlparse(self.path).query)
+                bed_id = int(query.get("bed_id", ["0"])[0])
+                join_text = query.get("join_date", [date.today().isoformat()])[0]
+                join_day = date.fromisoformat(join_text)
+                conn = get_connection()
+                try:
+                    row = conn.execute("SELECT b.base_yearly_price,p.owner_id FROM beds b JOIN rooms r ON r.id=b.room_id JOIN pgs p ON p.id=r.pg_id WHERE b.id=?", (bed_id,)).fetchone()
+                finally:
+                    conn.close()
+                if row is None or row["owner_id"] != user["user_id"]:
+                    return self._send(404, {"error": "Bed not found."})
+                return self._send(200, {"suggested_price": calculate_agreed_price(row["base_yearly_price"], join_day)})
             parts = path.split("/")
             if len(parts) >= 4 and parts[1:3] == ["api", "pgs"] and parts[3].isdigit():
                 pg_id = int(parts[3])
-                if not any(p["id"] == pg_id for p in get_pgs_for_owner(user["user_id"])):
+                if not self._owned_pg(user, pg_id):
                     return self._send(404, {"error": "Property not found."})
                 if len(parts) == 5 and parts[4] == "layout":
                     return self._send(200, get_pg_layout(pg_id))
@@ -84,85 +142,163 @@ class Handler(BaseHTTPRequestHandler):
                     return self._send(200, get_tickets_for_pg(pg_id, include_resolved=True))
                 if len(parts) == 5 and parts[4] == "announcements":
                     return self._send(200, get_announcements_for_pg(pg_id))
+                if len(parts) == 5 and parts[4] == "tenants":
+                    conn = get_connection()
+                    try:
+                        rows = conn.execute(
+                            "SELECT t.id AS tenant_id,t.name,t.phone,t.join_date,t.deposit,t.agreed_yearly_price,"
+                            "t.is_active,b.label AS bed_label,r.room_no FROM tenants t "
+                            "JOIN beds b ON b.id=t.bed_id JOIN rooms r ON r.id=b.room_id "
+                            "WHERE r.pg_id=? ORDER BY t.is_active DESC,t.name COLLATE NOCASE", (pg_id,)
+                        ).fetchall()
+                    finally:
+                        conn.close()
+                    result = []
+                    for row in rows:
+                        item = dict(row)
+                        item["financials"] = get_tenant_financials(item["tenant_id"])
+                        result.append(item)
+                    return self._send(200, result)
             if len(parts) == 4 and parts[1:3] == ["api", "beds"] and parts[3].isdigit():
-                bed_id = int(parts[3])
+                details = get_bed_details(int(parts[3]))
+                if details is None:
+                    return self._send(404, {"error": "Bed not found."})
                 conn = get_connection()
                 try:
-                    row = conn.execute("SELECT p.owner_id FROM beds b JOIN rooms r ON r.id=b.room_id JOIN pgs p ON p.id=r.pg_id WHERE b.id=?", (bed_id,)).fetchone()
+                    row = conn.execute("SELECT p.owner_id FROM beds b JOIN rooms r ON r.id=b.room_id JOIN pgs p ON p.id=r.pg_id WHERE b.id=?", (int(parts[3]),)).fetchone()
                 finally:
                     conn.close()
                 if row is None or row["owner_id"] != user["user_id"]:
                     return self._send(404, {"error": "Bed not found."})
-                details = get_bed_details(bed_id)
-                return self._send(200, details) if details is not None else self._send(404, {"error": "Bed not found."})
+                return self._send(200, details)
             if len(parts) == 4 and parts[1:3] == ["api", "tenants"] and parts[3].isdigit():
                 tenant_id = int(parts[3])
-                conn = get_connection()
-                try:
-                    row = conn.execute("SELECT p.owner_id FROM tenants t JOIN beds b ON b.id=t.bed_id JOIN rooms r ON r.id=b.room_id JOIN pgs p ON p.id=r.pg_id WHERE t.id=?", (tenant_id,)).fetchone()
-                finally:
-                    conn.close()
+                row = self._tenant_owner(tenant_id)
                 if row is None or row["owner_id"] != user["user_id"]:
                     return self._send(404, {"error": "Tenant not found."})
-                details = get_tenant_financials(tenant_id)
-                return self._send(200, details) if details is not None else self._send(404, {"error": "Tenant not found."})
+                conn = get_connection()
+                try:
+                    profile = conn.execute("SELECT id AS tenant_id,name,phone,join_date,deposit,agreed_yearly_price,is_active,bed_id FROM tenants WHERE id=?", (tenant_id,)).fetchone()
+                finally:
+                    conn.close()
+                return self._send(200, {"profile": dict(profile), "financials": get_tenant_financials(tenant_id)})
             return self._send(404, {"error": "Endpoint not found."})
         except (ValueError, TypeError) as exc:
             return self._send(400, {"error": str(exc)})
+        except sqlite3.IntegrityError:
+            return self._send(400, {"error": "The record conflicts with existing data. Check the username and bed assignment."})
         except Exception as exc:
-            return self._send(500, {"error": str(exc)})
+            print(f"[GharPar API] Request failed: {exc}")
+            return self._send(500, {"error": "The request could not be completed. Check the API terminal for details."})
 
     def do_POST(self):
         path = urlparse(self.path).path.rstrip("/") or "/"
         try:
             data = self._body()
             if path == "/api/login":
-                result = login(str(data.get("username", "")), str(data.get("password", "")))
+                result = login(str(data.get("username", "")).strip(), str(data.get("password", "")))
                 if not result:
                     return self._send(401, {"error": "Incorrect username or password, or account inactive."})
-                if result["role"] != "owner":
-                    return self._send(403, {"error": "Tenant web access is not available yet. Use the desktop app for tenant accounts."})
                 token = secrets.token_urlsafe(32)
                 TOKENS[token] = result
-                return self._send(200, {"token": token, "user": {"username": result["username"], "role": result["role"]}})
+                return self._send(200, {"token": token, "user": {"username": result["username"], "role": result["role"], "tenant_id": result.get("tenant_id")}})
             user = self._user()
             if not user:
                 return self._send(401, {"error": "Please sign in to continue."})
-            if user["role"] != "owner":
-                return self._send(403, {"error": "Owner access required."})
             if path == "/api/logout":
                 token = self.headers.get("Authorization", "").removeprefix("Bearer ")
                 TOKENS.pop(token, None)
                 return self._send(200, {"ok": True})
+            if user["role"] == "tenant":
+                if path == "/api/tenant/tickets":
+                    ticket_id = create_ticket(user["tenant_id"], str(data.get("category", "")), str(data.get("description", "")), str(data.get("urgency", "")))
+                    return self._send(201, {"id": ticket_id})
+                return self._send(403, {"error": "Owner access required."})
             parts = path.split("/")
             if len(parts) == 5 and parts[1:3] == ["api", "pgs"] and parts[3].isdigit() and parts[4] == "announcements":
                 pg_id = int(parts[3])
-                if not any(p["id"] == pg_id for p in get_pgs_for_owner(user["user_id"])):
+                if not self._owned_pg(user, pg_id):
                     return self._send(404, {"error": "Property not found."})
                 announcement_id = add_announcement(pg_id, str(data.get("message", "")))
                 return self._send(201, {"id": announcement_id})
+            if len(parts) == 5 and parts[1:3] == ["api", "pgs"] and parts[3].isdigit() and parts[4] == "tenants":
+                pg_id = int(parts[3])
+                if not self._owned_pg(user, pg_id):
+                    return self._send(404, {"error": "Property not found."})
+                bed_id = int(data.get("bed_id", 0))
+                conn = get_connection()
+                try:
+                    bed = conn.execute("SELECT b.base_yearly_price,p.id AS pg_id,p.owner_id FROM beds b JOIN rooms r ON r.id=b.room_id JOIN pgs p ON p.id=r.pg_id WHERE b.id=?", (bed_id,)).fetchone()
+                finally:
+                    conn.close()
+                if bed is None or bed["pg_id"] != pg_id or bed["owner_id"] != user["user_id"]:
+                    return self._send(400, {"error": "Choose a bed in this property."})
+                join_text = str(data.get("join_date", ""))
+                join_day = date.fromisoformat(join_text)
+                suggested = calculate_agreed_price(bed["base_yearly_price"], join_day)
+                price = int(data.get("agreed_yearly_price", suggested))
+                tenant_id = add_tenant(bed_id, str(data.get("name", "")), str(data.get("phone", "")), join_text, int(data.get("deposit", 0)), price, str(data.get("username", "")), str(data.get("password", "")))
+                return self._send(201, {"tenant_id": tenant_id, "suggested_price": suggested})
+            if len(parts) == 5 and parts[1:3] == ["api", "tenants"] and parts[3].isdigit() and parts[4] == "payments":
+                tenant_id = int(parts[3]); row = self._tenant_owner(tenant_id)
+                if row is None or row["owner_id"] != user["user_id"]:
+                    return self._send(404, {"error": "Tenant not found."})
+                payment_id = add_payment(tenant_id, int(data.get("amount", 0)), str(data.get("paid_on", date.today().isoformat())), str(data.get("mode", "")))
+                return self._send(201, {"payment_id": payment_id})
+            if len(parts) == 5 and parts[1:3] == ["api", "tenants"] and parts[3].isdigit() and parts[4] == "vacate":
+                tenant_id = int(parts[3]); row = self._tenant_owner(tenant_id)
+                if row is None or row["owner_id"] != user["user_id"]:
+                    return self._send(404, {"error": "Tenant not found."})
+                vacate_tenant(tenant_id)
+                return self._send(200, {"ok": True})
             if len(parts) == 5 and parts[1:3] == ["api", "tickets"] and parts[3].isdigit() and parts[4] == "status":
-                ticket_id = int(parts[3])
-                new_status = str(data.get("status", ""))
+                ticket_id = int(parts[3]); new_status = str(data.get("status", ""))
                 conn = get_connection()
                 try:
                     row = conn.execute("SELECT pg_id FROM tickets WHERE id = ?", (ticket_id,)).fetchone()
                 finally:
                     conn.close()
-                if row is None or not any(p["id"] == row["pg_id"] for p in get_pgs_for_owner(user["user_id"])):
+                if row is None or not self._owned_pg(user, row["pg_id"]):
                     return self._send(404, {"error": "Ticket not found."})
                 update_ticket_status(ticket_id, new_status)
                 return self._send(200, {"ok": True})
             return self._send(404, {"error": "Endpoint not found."})
         except (ValueError, TypeError, json.JSONDecodeError) as exc:
             return self._send(400, {"error": str(exc)})
+        except sqlite3.IntegrityError:
+            return self._send(400, {"error": "The record conflicts with existing data. Check the username and bed assignment."})
         except Exception as exc:
-            return self._send(500, {"error": str(exc)})
+            print(f"[GharPar API] Request failed: {exc}")
+            return self._send(500, {"error": "The request could not be completed. Check the API terminal for details."})
+
+    def do_DELETE(self):
+        path = urlparse(self.path).path.rstrip("/") or "/"
+        user = self._user()
+        if not user:
+            return self._send(401, {"error": "Please sign in to continue."})
+        if user["role"] != "owner":
+            return self._send(403, {"error": "Owner access required."})
+        parts = path.split("/")
+        try:
+            if len(parts) == 4 and parts[1:3] == ["api", "announcements"] and parts[3].isdigit():
+                announcement_id = int(parts[3]); conn = get_connection()
+                try:
+                    row = conn.execute("SELECT pg_id FROM announcements WHERE id=?", (announcement_id,)).fetchone()
+                finally:
+                    conn.close()
+                if row is None or not self._owned_pg(user, row["pg_id"]):
+                    return self._send(404, {"error": "Announcement not found."})
+                delete_announcement(announcement_id)
+                return self._send(200, {"ok": True})
+            return self._send(404, {"error": "Endpoint not found."})
+        except Exception:
+            return self._send(500, {"error": "The request could not be completed. Check the API terminal for details."})
 
 
 def main():
     create_tables()
-    host, port = "127.0.0.1", 8765
+    host = os.environ.get("GHARPAR_API_HOST", "127.0.0.1")
+    port = int(os.environ.get("PORT", "8765"))
     print(f"GharPar API running at http://{host}:{port} (Ctrl+C to stop)", flush=True)
     try:
         ThreadingHTTPServer((host, port), Handler).serve_forever()

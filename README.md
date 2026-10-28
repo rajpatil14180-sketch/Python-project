@@ -1,24 +1,36 @@
 # GharPar PG Manager
 
-A beginner-friendly desktop PG management application built with Python's standard library, Tkinter, and SQLite.
+GharPar is a beginner-friendly PG management application built with Python, Tkinter, SQLite, and a React/Vite web workspace. Business rules remain in the existing Python core services; the web interface calls those services through `web_api.py`.
 
 ## Requirements
-- Python 3.10 or newer recommended
-- No pip packages required
 
-## Run
-1. Open a terminal in this folder.
-2. Create/reset the sample database: `python seed_data.py`
-3. Start the application: `python main.py`
+- Python 3.10 or newer
+- Node.js and npm for the web interface
+- No Python packages required
 
-`seed_data.py` resets the app tables to the demo dataset, so do not run it if you need to keep real tenant/payment records.
+## Run the desktop app
 
-## Demo accounts
-- Owner: `owner` / `owner123`
-- Tenant: `amit` / `tenant123` (other tenants use their first name in lowercase)
+```powershell
+py seed_data.py
+py main.py
+```
+
+`seed_data.py` resets the sample tables. Do not run it if you need to preserve real tenant/payment records.
+
+## Run the web MVP
+
+See [WEB_SETUP.md](WEB_SETUP.md) for the two-terminal setup and demo accounts.
 
 ## Run tests
-`python -m unittest discover -s tests -v`
 
-## Notes
-The MVP supports owner and tenant login, PG/bed viewing, tenant financial summaries, maintenance tickets, and announcements. Tenant self-booking and reservations are intentionally excluded.
+```powershell
+py -m unittest discover -s tests -v
+```
+
+## Hosting the .in domain
+
+See [DEPLOYMENT.md](DEPLOYMENT.md). The current server is an MVP/local-development API and must be hardened before public use with real tenant data.
+
+## MVP scope
+
+Supports owner and tenant logins, two PGs with four rooms and eight beds each, late-join pricing, 12 installments, payment tracking, tenant history, maintenance tickets, and announcements. Reservations and tenant self-booking are intentionally excluded.
